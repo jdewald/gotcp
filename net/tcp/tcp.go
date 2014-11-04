@@ -66,6 +66,15 @@ func (packet *TCPPacket) IsACK() bool {
 	return packet.Header.DataOffsetAndFlags & CTRL_ACK != 0
 }
 
+// Acknowledge the up to the given sequence number
+// This is not SACK
+func (packet TCPPacket) ACK(seq uint32) (*TCPPacket) {
+	packet.Header.Ack = seq	
+	packet.Header.DataOffsetAndFlags |= CTRL_ACK
+
+	return &packet
+}
+
 // TODO: Move these printers to another file
 func (hdr *TCPHeader) Display() {
 	fmt.Printf("----- TCP Header -----\n")
@@ -111,7 +120,7 @@ func Parse(data []byte) (packet *TCPPacket, err error) {
 	packet.Data = data[offsetBytes:]
 	fmt.Printf("Length of TCP Segment: %d\n", numBytes)
 
-	packet.Display()
+	//packet.Display()
 
 	return packet, nil
 }

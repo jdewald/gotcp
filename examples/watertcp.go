@@ -24,7 +24,7 @@ func main() {
     	log.Fatal(err)
     }
 
-    _,err = tl.Accept()
+    tc,err := tl.Accept()
 
     if err != nil {
     	log.Fatal(err)
@@ -32,15 +32,21 @@ func main() {
 
     fmt.Println("Connected!")
 
-	//myAddr := "10.0.3.15"
-    //protocol := "tcp"
-    //netaddr, err := net.ResolveIPAddr("ip4", myAddr)
-    //conn, err := net.ListenIP("ip4:"+protocol, netaddr)
-//    conn, err := net.ListenPacket("ip", "127.0.0.1")
-//    conn, _ := net.ListenIP("ip", netaddr)
-   
-//    conn, err := net.ListenIP("ip4", netaddr)
+    // using a "standard" interface
+    buf := make([]byte, 1024)
+
+    read := 0
+    for {
+        read, err = tc.Read(buf)
 
 
+        if err != nil {
+            log.Fatal(err)
+        }
+    
+        if read > 0 {
+            fmt.Printf("Read: %s\n", string(buf[:read]))
+        }
+    }
 
 }

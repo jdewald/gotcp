@@ -3,6 +3,7 @@ package tcp
 import (
 	"log"
 	"fmt"
+	"math"
 	//"net"
 	"bytes"
 	"bufio"
@@ -10,6 +11,7 @@ import (
 	"math/rand"
 	"github.com/jdewald/gotcp/net"
 	"github.com/jdewald/gotcp/net/ip"
+	"github.com/eapache/channels"
 )
 
 
@@ -36,6 +38,8 @@ type TCPConn struct
 	unacked			uint32 "SND.UNA"
 
 	ipConn 			*ip.IPConn
+	readChan 		channels.Channel	
+	sem   			chan bool
 }
 
 func (conn *TCPConn) ident() string {
@@ -48,7 +52,7 @@ func (conn *TCPConn) Send(tcpPacket *TCPPacket) (written int, err error) {
 	// So we don't want to keep allocating space when we can just have
 	// it pre-allocated
 
-	tcpPacket.Display()
+	//tcpPacket.Display()
 
 	packet := new(bytes.Buffer) 
 	w := bufio.NewWriter(packet)
@@ -88,6 +92,21 @@ func (conn *TCPConn) Send(tcpPacket *TCPPacket) (written int, err error) {
 	return
 }
 
+func (conn *TCPConn) Read(buf []byte) (read int, err error) {
+	amountToRead := int(math.Min(float64(cap(buf)), float64(channels.Buffer(conn.readChan).Len())))
+
+	conn.sem <- true
+
+	for i := 0; i < amountToRead; i++ {
+		buf[i] = (<- conn.readChan.Out()).(byte)
+	}
+
+	<- conn.sem
+
+	return amountToRead, nil
+
+}
+
 // Create the "header" made up of Source and Dest IP, protocoll and tcp length
 // This is not included in the packet but is used as part of the checksum
 // this may be optional as it gets offloaded
@@ -105,8 +124,8 @@ func (conn *TCPConn) buildPseudoHeader(tcpPacket *TCPPacket) []byte {
 
 	w.Flush()
 
-	fmt.Printf("TCPConn=>buildPseudoHeader=>bytes %v\n", hdrBuffer.Bytes())
-	fmt.Printf("TCPConn=>buildPseudoHeader=>tcpLen %d\n", tcpLen)
+	//fmt.Printf("TCPConn=>buildPseudoHeader=>bytes %v\n", hdrBuffer.Bytes())
+	//fmt.Printf("TCPConn=>buildPseudoHeader=>tcpLen %d\n", tcpLen)
 
 	return hdrBuffer.Bytes()
 }
@@ -145,6 +164,8 @@ func Listen(localIP string, port uint16) (*TCPListener, error) {
 
 }
 
+// Because we're using the /dev/tun interface we need to basically bootstrap
+// our network and then we can use it as normal
 func Start() (error) {
 
 	var err error
@@ -162,7 +183,7 @@ func Start() (error) {
 }
 
 
-
+// This is essentially our "run loop"
 func listenForPackets() {
 	for {
 		packet,err := ipStack.Receive()		
@@ -172,7 +193,6 @@ func listenForPackets() {
 		}
 
 
-		fmt.Printf("TCP=>Parsing Packet\n")
 		tcpPacket, err := Parse(packet.Packet)
 		if err != nil {
 			log.Fatal(err)
@@ -180,7 +200,6 @@ func listenForPackets() {
 
 		tl := listeners[packet.Destination() + string(tcpPacket.Header.DestPort)]
 		ident := fmt.Sprintf("%s,%d,%s,%d", packet.Destination(), tcpPacket.Header.DestPort,packet.Source(), tcpPacket.Header.SourcePort)
-		fmt.Printf("TCPConn=>ident = %s\n", ident)
 		tcpConn := connections[ident]
 
 		if tcpConn == nil { // Start of a new connection
@@ -209,7 +228,6 @@ func listenForPackets() {
 			}
 		}
 
-		fmt.Printf("TCP=>Connection is %v\n", tcpConn)
 		switch tcpConn.state {
 		case STATE_SYN_SENT, STATE_SYN_RECEIVED:
 			tcpConn.recvNextSeq = tcpPacket.Header.Seq + 1    // The SYN is considered to have occupied the first one
@@ -218,60 +236,40 @@ func listenForPackets() {
 			if tcpPacket.IsACK() {
 				fmt.Println("TCP=>Moving to ESTABLISHED State")
 				tcpConn.state = STATE_ESTABLISHED
+				tcpConn.readChan = channels.NewNativeChannel(1024 * 10) // 10K
+				tcpConn.sem = make(chan bool, 1)
 				tl.connChannel <- tcpConn 
 			} else {
 
-				err = SendSynAck(tcpConn)
+				err = sendSynAck(tcpConn)
 				if err != nil {
 					fmt.Println("TCP=>Unable to perform SynAck")
 					log.Fatal(err)
 				}
 			}
+		case STATE_ESTABLISHED:
+			// TODO: We actually have to see how much we were able to write into our buffer
+			tcpConn.recvNextSeq = tcpPacket.Header.Seq + uint32(len(tcpPacket.Data))
+			tcpConn.recvWindow = tcpPacket.Header.Window // TODO: Figure out our own
+
+			err = sendAck(tcpConn)
+			if err != nil {
+				log.Fatal(err)
+			}
+
+			tcpConn.sem <- true
+			fmt.Println("Writing data to read channel")
+			for _, val := range tcpPacket.Data {
+				tcpConn.readChan.In() <- val 
+			}
+
+			<- tcpConn.sem
+			fmt.Println("Done writing")
 
 		default:
 			fmt.Printf("What're we doing with state %s:%v\n", tcpConn.ident(), tcpConn.state)	
 		}
 
-
- //   ipHdr.SourceIP = net.ParseIP(addr.String()) 
-/*
-		pseudohdr := buildPseudoHeader(&ipHdr, uint16(numBytes))
-
-
-		chkbuf := make([]byte, 12 + numBytes)
-		copy(chkbuf, pseudohdr)
-//    copy(chkbuf[12:], buf[LEN_IPHDR:(numBytes + LEN_IPHDR)])
-		copy(chkbuf[12:], buf[0:numBytes])
-
-		chkbuf[28] = 0
-		chkbuf[29] = 0
-		fmt.Printf("Check buffer: %d, %v\n", len(chkbuf), chkbuf)
-		chksum := net.Checksum(chkbuf)
-		fmt.Printf("Calculated checksum: %d %x %b\n", chksum, chksum, chksum)
-    // It seems that the TCP checksum is getting set to a constant value when 
-    // trying to telnet locally, so potentially it doesn't get updated
-    // until it actually tries to leave the network
-		ipHdr.Display()
-		hdr.Display(optionsAndPadding)
-
- //   fmt.Printf("Remaining bytes to data: %d\n", offsetBytes - LEN_HDR_PRE_OPTIONS)
-		fmt.Printf("Data Size: %d\n", uint16(numBytes) - offsetBytes)
-		fmt.Printf("TCP=>Received packet from %s ")
-
-
-
-
-    SendSynAck(ifce, &ipHdr, &hdr, optionsAndPadding)
-
-    // Get final ack
-    numBytes, err = ifce.Read(buf)
-    if err != nil {
-    	log.Fatal(err)
-    }
-    fmt.Printf("Read another %d bytes\n", numBytes)
-
-    SendSynAck(ifce, &ipHdr, &hdr, optionsAndPadding)
-		*/
 	}
 }
 
@@ -280,10 +278,45 @@ func initialSequenceNumber() uint32 {
 	return rand.Uint32()
 }
 
+func sendAck(conn *TCPConn) (err error) {
+
+	// TODO: Pull from a "Free list"?
+	var ackPacket TCPPacket
+
+	var hdr TCPHeader
+
+	ackPacket.Header = &hdr
+
+	hdr.SourcePort = conn.localPort 
+	hdr.DestPort = conn.remotePort 
+
+	hdr.Seq = conn.sendNextSeq 
+
+	dataOffset := uint16(20)
+
+	ackPacket.ACK(conn.recvNextSeq)
+
+	hdr.DataOffsetAndFlags |= ((dataOffset / 4) << 12)	    // Number of words 
+	hdr.Window = conn.recvWindow					// TODO: Set appropriately
+	hdr.Checksum = 0 								// Should get calcualted automatically?
+	hdr.UrgentPointer = 0
+
+	ackPacket.OptionsAndPadding = make([]byte,0) // no options
+	ackPacket.Data = make([]byte, 0)
+
+	// sequence management
+	conn.sendNextSeq = hdr.Seq + 1
+	conn.unacked = hdr.Seq
+
+	written, err := conn.Send(&ackPacket)
 
 
+	fmt.Printf("Wrote %d bytes with error %v\n", written, err)
 
-func SendSynAck(conn *TCPConn) (err error) {
+	return err
+}
+
+func sendSynAck(conn *TCPConn) (err error) {
 
 	// TODO: Pull from a "Free list"?
 	var ackPacket TCPPacket
@@ -299,9 +332,9 @@ func SendSynAck(conn *TCPConn) (err error) {
 
 	dataOffset := uint16(20)
 
-	hdr.Ack = conn.recvNextSeq 							// Roger that!
+	ackPacket.ACK(conn.recvNextSeq)
 
-	hdr.DataOffsetAndFlags = CTRL_SYN | CTRL_ACK  // we'll add the data offset 
+	hdr.DataOffsetAndFlags = CTRL_SYN   // we'll add the data offset 
 	hdr.DataOffsetAndFlags |= ((dataOffset / 4) << 12)	    // Number of words 
 	hdr.Window = conn.recvWindow					// TODO: Set appropriately
 	hdr.Checksum = 0 								// Should get calcualted automatically?
